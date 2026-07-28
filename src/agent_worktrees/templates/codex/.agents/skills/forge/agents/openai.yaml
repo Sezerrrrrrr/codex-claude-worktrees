@@ -1,0 +1,6 @@
+interface:
+  display_name: 'Forge'
+  short_description: 'Codex-only sequential product-to-code workflow'
+  default_prompt: 'Use $forge at high effort to build the specification with Fable, run one bounded read-only Sol challenge, implement sequentially with Terra and Kimi, preserve durable memory through automatic 40% compaction, and repeat tests until they pass.'
+policy:
+  allow_implicit_invocation: false

@@ -4,7 +4,7 @@ Use Codex and Claude Code on the same code without copying files or maintaining 
 adapters. The toolkit creates five permanent Git worktree lanes, gives both agents complete native
 configuration, and keeps equivalent instructions, skills, hooks, and settings aligned.
 
-> Alpha: version 0.1 targets macOS, iTerm2, zsh, GitHub, Python 3.11+, Codex CLI, and Claude Code.
+> Alpha: version 0.2 targets macOS, iTerm2, zsh, GitHub, Python 3.11+, Codex CLI, and Claude Code.
 
 ## The 60-second mental model
 
@@ -141,6 +141,44 @@ local a == origin/a == origin/<default-branch>
 ```
 
 An ordinary Stop hook never creates or merges a PR and never pushes the default branch.
+
+## Optional Forge workflow — Codex only
+
+Forge is an optional, durable product-to-code workflow included with this toolkit. It is available
+only as the Codex `$forge` skill; there is intentionally no Claude Code `/forge` counterpart.
+Forge still requires an installed and authenticated Claude Code CLI because Codex launches Fable as
+an isolated read-only specification partner.
+
+Install it into a configured project:
+
+```bash
+agent-worktrees install-forge /path/to/your-project
+```
+
+Then start a new Codex session in one permanent lane, review and trust the changed project hook with
+`/hooks`, and invoke:
+
+```text
+$forge Build the requested feature
+$forge max Build the requested feature at maximum common effort
+```
+
+The default effort is `high` for Fable, GPT-5.6 Sol, and GPT-5.6 Terra. An optional `low`, `medium`,
+`high`, `xhigh`, or `max` parameter applies to all three. Kimi K3 always uses its own highest
+supported effort, `xhigh`.
+
+Forge compacts automatically at 40% context use and restores a durable record containing the exact
+current specification, exact visible user/Fable conversation, completed-task reports, validations,
+and implementation deviations or Sol escalation rationale. Sol receives exactly one bounded
+technical review during specification; Fable and the user finish the specification afterward.
+
+Installation adds the Codex-only skill, a Codex `SessionStart(compact)` hook, `.forge-state/` to the
+project ignore file, and the project-level Codex compaction threshold. The 40% Codex threshold
+therefore applies to every new Codex session in that project, not only Forge. If parity is already
+baselined, review the added Codex-only group and run `agent-worktrees parity baseline` afterward.
+
+Kimi frontend routing requires the separate isolated CC Switch profile described in
+[docs/forge.md](docs/forge.md). Forge stops rather than silently substituting a different model.
 
 ## Git words without the jargon
 

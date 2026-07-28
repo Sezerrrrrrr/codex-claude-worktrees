@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.agents/skills/forge/scripts/forge-memory-hook.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

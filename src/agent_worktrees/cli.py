@@ -11,7 +11,7 @@ from .config import ensure_default_config, load_config
 from .git_workflows import pull, ship
 from .git_lanes import ensure_worktrees, primary_checkout_root, registered_worktrees
 from .hook import parse_payload, stop_hook
-from .installer import bootstrap_install
+from .installer import bootstrap_install, install_forge
 from .notifications import configure as configure_notifications
 from .notifications import send_notification
 from .parity import baseline, bootstrap, check, status, synchronize
@@ -27,6 +27,11 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     install = subparsers.add_parser("install", help="Seed the walkthrough into a Git repository")
     install.add_argument("target", nargs="?", default=".")
+    forge = subparsers.add_parser(
+        "install-forge",
+        help="Install the optional Codex-only Forge workflow",
+    )
+    forge.add_argument("target", nargs="?", default=".")
 
     walkthrough = subparsers.add_parser("walkthrough", help="Run or advance guided setup")
     walkthrough.add_argument("--harness", choices=("codex", "claude"), required=True)
@@ -84,9 +89,9 @@ def main(arguments: list[str] | None = None) -> int:
             from .notifications import notification_main
 
             return notification_main([args.payload] if args.payload is not None else [])
-        if args.command == "install":
+        if args.command in {"install", "install-forge"}:
             root = repository_root(Path(args.target).resolve())
-            result = bootstrap_install(root)
+            result = bootstrap_install(root) if args.command == "install" else install_forge(root)
         else:
             root = repository_root()
             ensure_default_config(root)

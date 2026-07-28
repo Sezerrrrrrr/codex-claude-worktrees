@@ -28,3 +28,10 @@ the toolkit will not auto-approve it.
 
 `validationCommands` are executable commands chosen by the target repository. Review changes to
 `.agent-worktrees/config.json` before invoking ship on untrusted code.
+
+The optional Codex-only Forge workflow launches local Codex and Claude Code subprocesses and stores
+plaintext working state under the ignored `.forge-state/` directory. Do not place credentials,
+regulated data, or private customer identifiers in Forge requests, specifications, task packets,
+reports, or evidence. Review and trust the installed Forge compaction hook before use. The isolated
+Kimi bootstrap writes provider authentication only under the user's private `~/.codex-kimi`
+directory and must never be copied into a repository.

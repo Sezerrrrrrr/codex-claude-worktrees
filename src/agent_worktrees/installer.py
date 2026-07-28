@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import stat
+import tomllib
 from pathlib import Path
 
 from .common import AgentWorktreesError, atomic_write, ensure_lines, read_json, write_json
@@ -39,7 +40,16 @@ def _template_files(provider: str, names: tuple[str, ...] | None = None) -> list
     files = [path for path in base.rglob("*") if path.is_file()]
     if names is None:
         return files
-    return [path for path in files if any(f"/skills/{name}/" in path.as_posix() or path.name == f"agent-worktrees-{name}.py" for name in names)]
+    return [
+        path
+        for path in files
+        if any(
+            f"/skills/{name}/" in path.as_posix()
+            or path.name == f"agent-worktrees-{name}.py"
+            or path.name.startswith(f"agent-worktrees-{name}-")
+            for name in names
+        )
+    ]
 
 
 def _install_templates(root: Path, names: tuple[str, ...], *, allow_existing: bool = False) -> None:
@@ -106,28 +116,156 @@ def full_install(root: Path) -> dict[str, object]:
     return {"status": "installed", "root": str(root), "mode": "full"}
 
 
-def _append_hook(raw: dict[str, object], event: str, command: str, status: str) -> None:
+def _append_hook(
+    raw: dict[str, object],
+    event: str,
+    command: str,
+    status: str,
+    *,
+    matcher: str = "",
+    timeout: int = 960,
+    additional_context_limit: int | None = None,
+) -> None:
     hooks = raw.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise AgentWorktreesError("native hook settings must contain a hooks object")
     entries = hooks.setdefault(event, [])
     if not isinstance(entries, list):
         raise AgentWorktreesError(f"hooks.{event} must be an array")
-    if any(command in json.dumps(entry) for entry in entries):
-        return
-    entries.append(
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            continue
+        if any(
+            isinstance(handler, dict) and handler.get("command") == command
+            for handler in entry["hooks"]
+        ):
+            return
+    handler: dict[str, object] = {
+        "type": "command",
+        "command": command,
+        "timeout": timeout,
+        "statusMessage": status,
+    }
+    if additional_context_limit is not None:
+        handler["additionalContextLimit"] = additional_context_limit
+    entries.append({"matcher": matcher, "hooks": [handler]})
+
+
+FORGE_CODEX_SETTINGS = {
+    "model_context_window": "272000",
+    "model_auto_compact_token_limit": "108800",
+    "model_auto_compact_token_limit_scope": '"total"',
+    "experimental_compact_prompt_file": '".agents/skills/forge/references/compaction-prompt.md"',
+}
+
+
+def _configure_forge_codex(root: Path) -> None:
+    relative = ".codex/config.toml"
+    if not safe_repository_path(root, relative):
+        raise AgentWorktreesError(f"unsafe Forge config path: {relative}")
+    path = root / relative
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    lines = text.splitlines(keepends=True)
+    section_index = next(
+        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
+        len(lines),
+    )
+    top = lines[:section_index]
+    remainder = lines[section_index:]
+    positions: dict[str, list[int]] = {key: [] for key in FORGE_CODEX_SETTINGS}
+    for index, line in enumerate(top):
+        candidate = line.split("#", 1)[0]
+        if "=" not in candidate:
+            continue
+        key = candidate.split("=", 1)[0].strip()
+        if key in positions:
+            positions[key].append(index)
+    for key, indexes in positions.items():
+        if len(indexes) > 1:
+            raise AgentWorktreesError(f"Codex config contains duplicate top-level {key}")
+        assignment = f"{key} = {FORGE_CODEX_SETTINGS[key]}\n"
+        if indexes:
+            top[indexes[0]] = assignment
+        else:
+            if top and not top[-1].endswith("\n"):
+                top[-1] += "\n"
+            top.append(assignment)
+    updated = "".join((*top, *remainder))
+    try:
+        tomllib.loads(updated)
+    except tomllib.TOMLDecodeError as error:
+        raise AgentWorktreesError(f"Forge would create invalid Codex config: {error}") from error
+    atomic_write(path, updated)
+
+
+def _register_forge_manifest(root: Path) -> bool:
+    path = root / ".agent-parity/manifest.json"
+    if not path.is_file():
+        return False
+    if not safe_repository_path(root, ".agent-parity/manifest.json"):
+        raise AgentWorktreesError("unsafe Forge parity manifest path")
+    raw = read_json(path)
+    if not isinstance(raw, dict) or not isinstance(raw.get("groups"), list):
+        raise AgentWorktreesError("parity manifest must contain a groups array")
+    desired = (
+        ".agents/skills/forge",
+        ".codex/hooks/agent-worktrees-forge-memory.py",
+        ".codex/config.toml",
+        ".codex/hooks.json",
+    )
+    classified = {
+        item
+        for group in raw["groups"]
+        if isinstance(group, dict)
+        for side in ("codex", "claude")
+        for item in group.get(side, [])
+        if isinstance(item, str)
+    }
+    missing = [item for item in desired if item not in classified]
+    if not missing:
+        return False
+    raw["groups"].append(
         {
-            "matcher": "",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command,
-                    "timeout": 960,
-                    "statusMessage": status,
-                }
-            ],
+            "name": "agent-worktrees-forge",
+            "classification": "codex-only",
+            "codex": missing,
+            "claude": [],
         }
     )
+    write_json(path, raw)
+    return True
+
+
+def install_forge(root: Path) -> dict[str, object]:
+    _install_templates(root, ("forge",), allow_existing=False)
+    _configure_forge_codex(root)
+    hooks_path = root / ".codex/hooks.json"
+    if not safe_repository_path(root, ".codex/hooks.json"):
+        raise AgentWorktreesError("unsafe native Forge hook settings path")
+    hooks = read_json(hooks_path, {"description": "Project hooks.", "hooks": {}})
+    if not isinstance(hooks, dict):
+        raise AgentWorktreesError(".codex/hooks.json must contain an object")
+    _append_hook(
+        hooks,
+        "SessionStart",
+        'python3 "$(git rev-parse --show-toplevel)/.codex/hooks/agent-worktrees-forge-memory.py"',
+        "Restoring Forge memory after compaction",
+        matcher="compact",
+        timeout=10,
+        additional_context_limit=0,
+    )
+    write_json(hooks_path, hooks)
+    if not safe_repository_path(root, ".gitignore"):
+        raise AgentWorktreesError("unsafe Forge ignore-file path")
+    ensure_lines(root / ".gitignore", (".forge-state/",))
+    manifest_changed = _register_forge_manifest(root)
+    return {
+        "status": "installed",
+        "root": str(root),
+        "mode": "forge-codex-only",
+        "manifestChanged": manifest_changed,
+        "next": "Review the files, trust the Codex hook in /hooks, then baseline parity if a ledger already exists.",
+    }
 
 
 def activate_hooks(root: Path) -> dict[str, object]:
@@ -192,6 +330,17 @@ def extra_manifest_groups(root: Path) -> list[dict[str, object]]:
             "classification": "adapted",
             "codex": [".codex/hooks.json"],
             "claude": [".claude/settings.json"],
+        },
+        {
+            "name": "agent-worktrees-forge",
+            "classification": "codex-only",
+            "codex": [
+                ".agents/skills/forge",
+                ".codex/hooks/agent-worktrees-forge-memory.py",
+                ".codex/config.toml",
+                ".codex/hooks.json",
+            ],
+            "claude": [],
         },
     ]
     return groups

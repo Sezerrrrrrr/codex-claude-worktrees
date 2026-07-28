@@ -14,7 +14,7 @@ package_data = [
 
 setup(
     name="codex-claude-worktrees",
-    version="0.1.0",
+    version="0.2.0",
     description="Persistent Git worktree lanes shared by Codex and Claude Code.",
     long_description=(Path(__file__).parent / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",

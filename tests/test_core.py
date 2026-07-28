@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,7 +15,13 @@ from agent_worktrees.common import AgentWorktreesError, CommandResult, run as re
 from agent_worktrees.config import ModelConfig, ProjectConfig, ensure_default_config, load_config
 from agent_worktrees.git_lanes import ensure_worktrees, validate_lane
 from agent_worktrees.git_workflows import _check_state, _rebase_continue, _retarget_lane, pull, ship
-from agent_worktrees.installer import activate_hooks, bootstrap_install, extra_manifest_groups, full_install
+from agent_worktrees.installer import (
+    activate_hooks,
+    bootstrap_install,
+    extra_manifest_groups,
+    full_install,
+    install_forge,
+)
 from agent_worktrees.notifications import configure_claude, configure_codex
 from agent_worktrees.shell_setup import install_shortcuts, shortcut_conflicts
 from agent_worktrees.parity import bootstrap as bootstrap_parity
@@ -264,6 +271,69 @@ class InstallerTest(unittest.TestCase):
         self.assertTrue((self.fixture.primary / ".claude/skills/walkthrough/SKILL.md").is_file())
         self.assertFalse((self.fixture.primary / ".agents/skills/ship/SKILL.md").exists())
         self.assertFalse((self.fixture.primary / ".agent-worktrees/runtime").exists())
+
+    def test_optional_forge_install_is_codex_only_and_configures_compaction(self) -> None:
+        codex_config = self.fixture.primary / ".codex/config.toml"
+        codex_config.parent.mkdir(parents=True)
+        codex_config.write_text(
+            'model = "existing-model"\n\n[features]\nhooks = true\n',
+            encoding="utf-8",
+        )
+        write_json(
+            self.fixture.primary / ".agent-parity/manifest.json",
+            {
+                "version": 1,
+                "groups": [
+                    {
+                        "name": "existing-codex",
+                        "classification": "codex-only",
+                        "codex": [".codex/config.toml"],
+                        "claude": [],
+                    }
+                ],
+            },
+        )
+
+        result = install_forge(self.fixture.primary)
+
+        self.assertEqual(result["mode"], "forge-codex-only")
+        self.assertTrue((self.fixture.primary / ".agents/skills/forge/SKILL.md").is_file())
+        self.assertTrue(
+            (self.fixture.primary / ".codex/hooks/agent-worktrees-forge-memory.py").is_file()
+        )
+        self.assertFalse((self.fixture.primary / ".claude/skills/forge").exists())
+        with codex_config.open("rb") as handle:
+            configured = tomllib.load(handle)
+        self.assertEqual(configured["model"], "existing-model")
+        self.assertEqual(configured["model_auto_compact_token_limit"], 108800)
+        self.assertEqual(configured["model_auto_compact_token_limit_scope"], "total")
+        self.assertTrue(configured["features"]["hooks"])
+        hooks = json.loads(
+            (self.fixture.primary / ".codex/hooks.json").read_text(encoding="utf-8")
+        )
+        compact = hooks["hooks"]["SessionStart"][0]
+        self.assertEqual(compact["matcher"], "compact")
+        self.assertEqual(compact["hooks"][0]["additionalContextLimit"], 0)
+        self.assertIn(".forge-state/", (self.fixture.primary / ".gitignore").read_text())
+        manifest = json.loads(
+            (self.fixture.primary / ".agent-parity/manifest.json").read_text(encoding="utf-8")
+        )
+        forge_group = next(
+            group for group in manifest["groups"] if group["name"] == "agent-worktrees-forge"
+        )
+        self.assertEqual(forge_group["classification"], "codex-only")
+        self.assertEqual(forge_group["claude"], [])
+
+    def test_forge_install_is_idempotent_for_unmodified_files(self) -> None:
+        first = install_forge(self.fixture.primary)
+        second = install_forge(self.fixture.primary)
+
+        self.assertEqual(first["status"], "installed")
+        self.assertEqual(second["status"], "installed")
+        hooks = json.loads(
+            (self.fixture.primary / ".codex/hooks.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(hooks["hooks"]["SessionStart"]), 1)
 
     def test_shortcuts_are_idempotent_and_detect_unmanaged_conflicts(self) -> None:
         ensure_worktrees(self.fixture.primary, self.fixture.config)
