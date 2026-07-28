@@ -1,0 +1,4 @@
+interface:
+  display_name: "Setup walkthrough"
+  short_description: "Configure shared Codex and Claude worktrees"
+  default_prompt: "Use $walkthrough to set up this repository."

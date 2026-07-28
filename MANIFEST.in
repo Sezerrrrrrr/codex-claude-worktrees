@@ -1,0 +1,2 @@
+recursive-include src/agent_worktrees/templates *
+recursive-include src/agent_worktrees/schemas *.json

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pull lane"
+  short_description: "Sync this persistent lane with GitHub"
+  default_prompt: "Use $pull to sync the current lane."

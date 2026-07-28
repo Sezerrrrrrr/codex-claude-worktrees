@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ship lane"
+  short_description: "Land this lane through a GitHub PR"
+  default_prompt: "Use $ship to land the current lane on GitHub."
