@@ -38,6 +38,7 @@ class Group:
     claude: tuple[str, ...]
     allow_cross_provider_references: bool = False
     bootstrap_source: str | None = None
+    bidirectional: bool = False
 
 
 def _generated(path: Path, root: Path | None = None) -> bool:
@@ -92,6 +93,7 @@ def load_manifest(root: Path) -> list[Group]:
             bootstrap_source=(
                 str(item["bootstrapSource"]) if item.get("bootstrapSource") in {"codex", "claude"} else None
             ),
+            bidirectional=bool(item.get("bidirectional", False)),
         )
         if not group.name:
             raise AgentWorktreesError("parity group names cannot be empty")
@@ -282,7 +284,8 @@ def synchronize(root: Path, config: ProjectConfig, harness: str) -> dict[str, ob
     previous = load_state(root)
     if not previous:
         raise AgentWorktreesError("parity is not baselined; complete the walkthrough first")
-    changed_names = set().union(*changed_sides(groups, current, previous).values())
+    changes = changed_sides(groups, current, previous)
+    changed_names = changes["codex"] | changes["claude"]
     if not changed_names:
         return {"status": "clean", "summary": "Native configurations are already aligned."}
     changed_groups = [group for group in groups if group.name in changed_names]
@@ -293,25 +296,46 @@ def synchronize(root: Path, config: ProjectConfig, harness: str) -> dict[str, ob
             "summary": "Provider-specific configuration changed and needs a decision.",
             "groups": sorted(gated),
         }
-    # Regenerate only paired groups that declare a source of truth (bootstrapSource):
-    # the counterpart is rebuilt from scratch from the source side. Editing an existing
-    # target in place proved unreliable (the model no-ops when the target already looks
-    # complete), so we always regenerate. Paired groups with no source (hand-maintained
-    # on both sides, e.g. pull/ship/walkthrough) and provider-only groups are accepted
-    # as-is and re-baselined without translation.
-    regen = [g for g in changed_groups if g.classification in PAIRED and g.bootstrap_source]
-    accepted = sorted(g.name for g in changed_groups if g not in regen)
+    # Decide, per changed paired group, which side to regenerate FROM. The counterpart is
+    # rebuilt from scratch (editing an existing target in place proved unreliable — the
+    # model no-ops when the target already looks complete).
+    #   - bidirectional: whichever side changed drives; if BOTH changed -> conflict.
+    #   - bootstrapSource: that side is always the source of truth.
+    #   - neither (hand-maintained both sides, e.g. pull/ship/walkthrough) or provider-only:
+    #     accepted as-is and re-baselined without translation.
+    regen: list[tuple[Group, str]] = []
+    accepted: list[str] = []
+    conflicts: list[str] = []
+    for group in changed_groups:
+        if group.classification not in PAIRED:
+            accepted.append(group.name)
+        elif group.bidirectional:
+            in_claude = group.name in changes["claude"]
+            in_codex = group.name in changes["codex"]
+            if in_claude and in_codex:
+                conflicts.append(group.name)
+            else:
+                regen.append((group, "claude" if in_claude else "codex"))
+        elif group.bootstrap_source:
+            regen.append((group, group.bootstrap_source))
+        else:
+            accepted.append(group.name)
+    if conflicts:
+        return {
+            "status": "conflict",
+            "summary": "Both native sides of a synced group changed since the last parity run.",
+            "groups": sorted(conflicts),
+        }
     if not regen:
         write_state(root, current)
         return {
             "status": "provider_only",
             "summary": "No counterpart regeneration was required.",
-            "groups": accepted,
+            "groups": sorted(accepted),
         }
     model_config = config.codex if harness == "codex" else config.claude
     applied: list[str] = []
-    for group in regen:
-        source = group.bootstrap_source
+    for group, source in regen:
         target = "claude" if source == "codex" else "codex"
         with tempfile.TemporaryDirectory(prefix="agent-parity-") as temporary_directory:
             stage = Path(temporary_directory)
@@ -373,7 +397,7 @@ def synchronize(root: Path, config: ProjectConfig, harness: str) -> dict[str, ob
         "status": "applied",
         "summary": f"Regenerated {len(applied)} native counterpart(s) from source.",
         "groups": applied,
-        "accepted": accepted,
+        "accepted": sorted(accepted),
     }
 
 
