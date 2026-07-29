@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-claude-worktrees"
-version = "0.2.0"
+version = "0.2.1"
 description = "Persistent Git worktree lanes shared by Codex and Claude Code, with native configuration parity."
 readme = "README.md"
 requires-python = ">=3.11"
