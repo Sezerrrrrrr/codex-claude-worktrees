@@ -40,12 +40,18 @@ class Group:
     bootstrap_source: str | None = None
 
 
-def _generated(path: Path) -> bool:
+def _generated(path: Path, root: Path | None = None) -> bool:
+    # Exclusion must be judged relative to the scan root: a lane lives *under*
+    # .codex/worktrees/<letter>, so its own path parts contain ".codex" +
+    # "worktrees". Checking absolute parts would flag every file inside a lane as
+    # generated. Nested worktrees only exist BELOW the primary checkout, so the
+    # relative path is the correct thing to test.
+    parts = path.relative_to(root).parts if root is not None else path.parts
     return (
-        "__pycache__" in path.parts
-        or "node_modules" in path.parts
-        or (".codex" in path.parts and "worktrees" in path.parts)
-        or (".agent-worktrees" in path.parts and "audit" in path.parts)
+        "__pycache__" in parts
+        or "node_modules" in parts
+        or (".codex" in parts and "worktrees" in parts)
+        or (".agent-worktrees" in parts and "audit" in parts)
         or path.suffix == ".pyc"
         or path.name in {".DS_Store", "settings.local.json"}
     )
@@ -57,7 +63,7 @@ def _files(root: Path, relatives: tuple[str, ...]) -> list[tuple[str, Path]]:
         path = root / relative
         if path.is_dir():
             for child in sorted(path.rglob("*")):
-                if (child.is_file() or child.is_symlink()) and not _generated(child):
+                if (child.is_file() or child.is_symlink()) and not _generated(child, root):
                     output.append((child.relative_to(root).as_posix(), child))
         else:
             output.append((relative, path))
@@ -196,13 +202,13 @@ def static_check(root: Path, groups: list[Group]) -> list[str]:
     runtime: set[str] = set()
     for base in (".agents", ".codex", ".claude"):
         for relative, path in _files(root, (base,)):
-            if path.is_file() and not _generated(path):
+            if path.is_file() and not _generated(path, root):
                 runtime.add(relative)
     for filename in ("AGENTS.md", "CLAUDE.md"):
         runtime.update(
             path.relative_to(root).as_posix()
             for path in root.rglob(filename)
-            if path.is_file() and not _generated(path)
+            if path.is_file() and not _generated(path, root)
         )
     unclassified = sorted(runtime - classified)
     if unclassified:
@@ -276,101 +282,98 @@ def synchronize(root: Path, config: ProjectConfig, harness: str) -> dict[str, ob
     previous = load_state(root)
     if not previous:
         raise AgentWorktreesError("parity is not baselined; complete the walkthrough first")
-    changes = changed_sides(groups, current, previous)
-    if changes["codex"] and changes["claude"]:
-        return {
-            "status": "conflict",
-            "summary": "Both native configurations changed since the last parity run.",
-            "groups": sorted(changes["codex"] | changes["claude"]),
-        }
-    if not changes["codex"] and not changes["claude"]:
+    changed_names = set().union(*changed_sides(groups, current, previous).values())
+    if not changed_names:
         return {"status": "clean", "summary": "Native configurations are already aligned."}
-    source = "codex" if changes["codex"] else "claude"
-    names = changes[source]
-    selected = [group for group in groups if group.name in names]
-    gated = [group.name for group in selected if group.classification in USER_GATED]
+    changed_groups = [group for group in groups if group.name in changed_names]
+    gated = [group.name for group in changed_groups if group.classification in USER_GATED]
     if gated:
         return {
             "status": "needs_user",
             "summary": "Provider-specific configuration changed and needs a decision.",
             "groups": sorted(gated),
         }
-    provider_only = [group.name for group in selected if group.classification not in PAIRED]
-    selected = [group for group in selected if group.classification in PAIRED]
-    if not selected:
+    # Regenerate only paired groups that declare a source of truth (bootstrapSource):
+    # the counterpart is rebuilt from scratch from the source side. Editing an existing
+    # target in place proved unreliable (the model no-ops when the target already looks
+    # complete), so we always regenerate. Paired groups with no source (hand-maintained
+    # on both sides, e.g. pull/ship/walkthrough) and provider-only groups are accepted
+    # as-is and re-baselined without translation.
+    regen = [g for g in changed_groups if g.classification in PAIRED and g.bootstrap_source]
+    accepted = sorted(g.name for g in changed_groups if g not in regen)
+    if not regen:
         write_state(root, current)
         return {
             "status": "provider_only",
-            "summary": "No counterpart was required.",
-            "groups": provider_only,
+            "summary": "No counterpart regeneration was required.",
+            "groups": accepted,
         }
-    target = "claude" if source == "codex" else "codex"
-    with tempfile.TemporaryDirectory(prefix="agent-parity-") as temporary_directory:
-        stage = Path(temporary_directory)
-        for group in selected:
+    model_config = config.codex if harness == "codex" else config.claude
+    applied: list[str] = []
+    for group in regen:
+        source = group.bootstrap_source
+        target = "claude" if source == "codex" else "codex"
+        with tempfile.TemporaryDirectory(prefix="agent-parity-") as temporary_directory:
+            stage = Path(temporary_directory)
             _copy(root, stage, "source", getattr(group, source))
-            _copy(root, stage, "target", getattr(group, target))
-        source_before = _stage_files(stage, "source")
-        model_config = config.codex if harness == "codex" else config.claude
-        result = invoke_structured(
-            harness,
-            stage,
-            _prompt(source, target, selected),
-            RESULT_SCHEMA,
-            model_config,
-            model_config.parity_effort,
-            writable=True,
-        )
-        if _stage_files(stage, "source") != source_before:
-            raise AgentWorktreesError("parity translator modified its source")
-        if result.get("status") == "needs_user" or result.get("questions") or result.get("uncertainties"):
-            return {**result, "groups": [group.name for group in selected]}
-        allowed_specs = {relative for group in selected for relative in getattr(group, target)}
-        allowed: set[str] = set()
-        for specification in allowed_specs:
-            allowed.update(relative for relative, path in _files(root, (specification,)) if path.is_file())
-            allowed.update(
-                relative for relative, path in _files(stage / "target", (specification,)) if path.is_file()
+            # Deliberately do NOT stage the existing target: force full regeneration.
+            source_before = _stage_files(stage, "source")
+            result = invoke_structured(
+                harness,
+                stage,
+                _prompt(source, target, [group]),
+                RESULT_SCHEMA,
+                model_config,
+                model_config.parity_effort,
+                writable=True,
             )
-        staged = _stage_files(stage, "target")
-        unexpected = set(staged) - allowed
-        if unexpected:
-            raise AgentWorktreesError(
-                "parity translator wrote unapproved files: " + ", ".join(sorted(unexpected))
-            )
-        if snapshot(root, groups) != current:
-            raise AgentWorktreesError("agent configuration changed during translation; retry")
-        backup = {relative: (root / relative).read_bytes() for relative in allowed if (root / relative).is_file()}
-        try:
-            for relative in allowed:
-                source_path = stage / "target" / relative
-                destination = root / relative
-                if source_path.is_file():
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = destination.with_name(destination.name + ".parity-tmp")
-                    shutil.copy2(source_path, temporary)
-                    temporary.replace(destination)
-                elif destination.is_file():
-                    destination.unlink()
-            errors = static_check(root, groups)
-            if errors:
-                raise AgentWorktreesError("; ".join(errors))
-        except Exception:
-            for relative in allowed:
-                destination = root / relative
-                if relative in backup:
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_bytes(backup[relative])
-                else:
-                    destination.unlink(missing_ok=True)
-            raise
+            if _stage_files(stage, "source") != source_before:
+                raise AgentWorktreesError("parity translator modified its source")
+            if result.get("status") == "needs_user" or result.get("questions"):
+                return {**result, "groups": [group.name]}
+            allowed: set[str] = set()
+            for specification in getattr(group, target):
+                allowed.update(rel for rel, path in _files(root, (specification,)) if path.is_file())
+                allowed.update(
+                    rel for rel, path in _files(stage / "target", (specification,)) if path.is_file()
+                )
+            staged = _stage_files(stage, "target")
+            unexpected = set(staged) - allowed
+            if unexpected:
+                raise AgentWorktreesError(
+                    "parity translator wrote unapproved files: " + ", ".join(sorted(unexpected))
+                )
+            backup = {rel: (root / rel).read_bytes() for rel in allowed if (root / rel).is_file()}
+            try:
+                for rel in allowed:
+                    source_path = stage / "target" / rel
+                    destination = root / rel
+                    if source_path.is_file():
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        temporary = destination.with_name(destination.name + ".parity-tmp")
+                        shutil.copy2(source_path, temporary)
+                        temporary.replace(destination)
+                    elif destination.is_file():
+                        destination.unlink()
+                step_errors = static_check(root, groups)
+                if step_errors:
+                    raise AgentWorktreesError("; ".join(step_errors))
+            except Exception:
+                for rel in allowed:
+                    destination = root / rel
+                    if rel in backup:
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_bytes(backup[rel])
+                    else:
+                        destination.unlink(missing_ok=True)
+                raise
+            applied.append(group.name)
     write_state(root, snapshot(root, groups))
     return {
-        **result,
-        "source": source,
-        "target": target,
-        "groups": [group.name for group in selected],
-        "providerSpecific": provider_only,
+        "status": "applied",
+        "summary": f"Regenerated {len(applied)} native counterpart(s) from source.",
+        "groups": applied,
+        "accepted": accepted,
     }
 
 
