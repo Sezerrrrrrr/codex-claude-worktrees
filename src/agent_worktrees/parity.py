@@ -39,6 +39,7 @@ class Group:
     allow_cross_provider_references: bool = False
     bootstrap_source: str | None = None
     bidirectional: bool = False
+    references: tuple[str, ...] = ()
 
 
 def _generated(path: Path, root: Path | None = None) -> bool:
@@ -94,6 +95,7 @@ def load_manifest(root: Path) -> list[Group]:
                 str(item["bootstrapSource"]) if item.get("bootstrapSource") in {"codex", "claude"} else None
             ),
             bidirectional=bool(item.get("bidirectional", False)),
+            references=tuple(str(value) for value in item.get("references", [])),
         )
         if not group.name:
             raise AgentWorktreesError("parity group names cannot be empty")
@@ -236,6 +238,16 @@ def _copy(root: Path, stage: Path, side: str, relatives: tuple[str, ...]) -> Non
             shutil.copy2(path, destination)
 
 
+def _copy_references(root: Path, stage: Path, group: Group) -> None:
+    """Stage authoritative provider docs so the translator reads real schema instead of guessing it."""
+    for relative in group.references:
+        source = root / relative
+        if source.is_file():
+            destination = stage / "reference" / Path(relative).name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+
 def _stage_files(stage: Path, side: str) -> dict[str, bytes]:
     base = stage / side
     if not base.exists():
@@ -264,6 +276,9 @@ Groups: {', '.join(group.name for group in groups)}
 Path contracts:
 {path_contracts}
 
+When reference/ contains provider documentation, READ IT FIRST — it is the authoritative schema for
+event names, config keys, hook types, field names, and file conventions; never guess what you can
+look up there.
 Read source/ and the existing target/. Edit only target/. Preserve intent and detail, but use the
 target provider's own instruction files, skill paths, hook syntax, terminology, and capabilities.
 Create missing target files under exactly the listed target path contracts. A listed directory may
@@ -340,6 +355,7 @@ def synchronize(root: Path, config: ProjectConfig, harness: str) -> dict[str, ob
         with tempfile.TemporaryDirectory(prefix="agent-parity-") as temporary_directory:
             stage = Path(temporary_directory)
             _copy(root, stage, "source", getattr(group, source))
+            _copy_references(root, stage, group)
             # Deliberately do NOT stage the existing target: force full regeneration.
             source_before = _stage_files(stage, "source")
             result = invoke_structured(
@@ -420,6 +436,7 @@ def bootstrap(root: Path, config: ProjectConfig, harness: str) -> dict[str, obje
             stage = Path(temporary_directory)
             _copy(root, stage, "source", getattr(group, source))
             _copy(root, stage, "target", getattr(group, target))
+            _copy_references(root, stage, group)
             source_before = _stage_files(stage, "source")
             model_config = config.codex if harness == "codex" else config.claude
             result = invoke_structured(
